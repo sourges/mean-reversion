@@ -211,6 +211,14 @@ class TestCsv(unittest.TestCase):
     def test_csv_name(self):
         self.assertEqual(csv_name("coinbase", "CRV/USD", "1h"), "candles_coinbase_crv_usd_1h.csv")
 
+    def test_csv_name_start_only_keeps_plain_name(self):
+        self.assertEqual(csv_name("coinbase", "CRV/USD", "1h", "2023-10-01"),
+                         "candles_coinbase_crv_usd_1h.csv")
+
+    def test_csv_name_with_end_date(self):
+        self.assertEqual(csv_name("coinbase", "CRV/USD", "1h", "2021-10-01", "2023-10-01"),
+                         "candles_coinbase_crv_usd_1h_2021-10-01_to_2023-10-01.csv")
+
 
 class TestMain(unittest.TestCase):
     """main() with the exchange and fetch_all faked, so no network is used."""
@@ -220,6 +228,7 @@ class TestMain(unittest.TestCase):
 
         def fake_fetch_all(exchange, symbol, timeframe, since_ms, now_ms):
             calls.append((exchange, symbol, timeframe, since_ms))
+            self.end_ms = now_ms
             return [candle(since_ms), candle(since_ms + H)]
 
         fake_ccxt = mock.Mock()
@@ -252,6 +261,23 @@ class TestMain(unittest.TestCase):
         calls, files = self.run_main(["2023-10-01", "coinbase", "BTC/USD"])
         self.assertEqual(calls[0][1], "BTC/USD")
         self.assertEqual(files, ["candles_coinbase_btc_usd_1h.csv"])
+
+    def test_end_date_stops_fetch_and_names_file(self):
+        calls, files = self.run_main(["2021-10-01", "coinbase", "CRV/USD", "2023-10-01"])
+        self.assertEqual(calls[0][3], date_to_ms("2021-10-01"))
+        self.assertEqual(self.end_ms, date_to_ms("2023-10-01"))
+        self.assertEqual(files, ["candles_coinbase_crv_usd_1h_2021-10-01_to_2023-10-01.csv"])
+
+    def test_no_end_date_fetches_to_now(self):
+        with mock.patch.object(fetch_candles.time, "time", return_value=1_800_000_000):
+            self.run_main([])
+        self.assertEqual(self.end_ms, 1_800_000_000_000)
+
+    def test_end_date_in_future_stops_at_now(self):
+        # 1,800,000,000 s is Jan 2027; an end date in 2030 can't fetch past now
+        with mock.patch.object(fetch_candles.time, "time", return_value=1_800_000_000):
+            self.run_main(["2026-01-01", "coinbase", "CRV/USD", "2030-01-01"])
+        self.assertEqual(self.end_ms, 1_800_000_000_000)
 
 
 if __name__ == "__main__":

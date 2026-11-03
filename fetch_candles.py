@@ -5,6 +5,9 @@ Usage (from the mean-reversion folder, venv active):
     python fetch_candles.py 2023-10-01              start from that date
     python fetch_candles.py 2023-10-01 kraken       another exchange
     python fetch_candles.py 2023-10-01 coinbase BTC/USD   another coin
+    python fetch_candles.py 2021-10-01 coinbase CRV/USD 2023-10-01
+                                       stop at an end date (not included);
+                                       the dates go in the file name
 
 The CSV has one row per candle:
     timestamp, date, open, high, low, close, volume
@@ -105,27 +108,38 @@ def write_csv(candles, path):
             writer.writerow([ts, ms_to_date(ts), o, h, l, c, v])
 
 
-def csv_name(exchange_id, symbol, timeframe):
-    """('coinbase', 'CRV/USD', '1h') -> 'candles_coinbase_crv_usd_1h.csv'"""
+def csv_name(exchange_id, symbol, timeframe, start_date=None, end_date=None):
+    """('coinbase', 'CRV/USD', '1h') -> 'candles_coinbase_crv_usd_1h.csv'
+
+    With an end date, both dates go in the name so it doesn't replace the
+    up-to-today file:
+    -> 'candles_coinbase_crv_usd_1h_2021-10-01_to_2023-10-01.csv'
+    """
     pair = symbol.replace("/", "_").lower()
-    return f"candles_{exchange_id}_{pair}_{timeframe}.csv"
+    if end_date is None:
+        return f"candles_{exchange_id}_{pair}_{timeframe}.csv"
+    return f"candles_{exchange_id}_{pair}_{timeframe}_{start_date}_to_{end_date}.csv"
 
 
 def main(args):
     start_date = args[0] if len(args) > 0 else START_DATE
     exchange_id = args[1] if len(args) > 1 else EXCHANGE
     symbol = args[2] if len(args) > 2 else SYMBOL
+    end_date = args[3] if len(args) > 3 else None
 
     exchange = getattr(ccxt, exchange_id)()  # public data, no API keys needed
     now_ms = int(time.time() * 1000)
-    print(f"Fetching {symbol} {TIMEFRAME} from {exchange_id}, starting {start_date}")
+    # stop at the end date (candles that open before it), but never past now
+    end_ms = now_ms if end_date is None else min(date_to_ms(end_date), now_ms)
+    until = "today" if end_date is None else end_date
+    print(f"Fetching {symbol} {TIMEFRAME} from {exchange_id}, {start_date} to {until}")
 
-    candles = fetch_all(exchange, symbol, TIMEFRAME, date_to_ms(start_date), now_ms)
+    candles = fetch_all(exchange, symbol, TIMEFRAME, date_to_ms(start_date), end_ms)
     if not candles:
         print("No candles came back. Check the symbol, exchange and date.")
         return
 
-    path = csv_name(exchange_id, symbol, TIMEFRAME)
+    path = csv_name(exchange_id, symbol, TIMEFRAME, start_date, end_date)
     write_csv(candles, path)
     print(f"Saved {len(candles)} candles to {path}")
     print(f"  first: {ms_to_date(candles[0][0])}   last: {ms_to_date(candles[-1][0])}")
