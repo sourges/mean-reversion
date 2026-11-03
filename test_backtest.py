@@ -5,8 +5,12 @@ import math
 import os
 import tempfile
 import unittest
+from unittest import mock
 
+import backtest
 from backtest import (
+    FEES,
+    above_trend,
     buy_and_hold,
     exit_reason,
     find_trades,
@@ -14,6 +18,7 @@ from backtest import (
     read_candles,
     summarize,
     trade_profit,
+    trades_name,
     write_trades,
     zscore,
 )
@@ -174,6 +179,69 @@ class TestStops(unittest.TestCase):
         self.assertEqual(trades[0]["hours"], 8)
 
 
+class TestTrendFilter(unittest.TestCase):
+    # Every case below ends with closes [10, 10, 7]: z = -1.414, a buy signal
+    # with window 3 and entry -1. The trend filter (5 candles) decides.
+
+    def test_above_trend(self):
+        # [2, 3, 10, 10, 7]: mean 6.4, close 7 is above
+        self.assertTrue(above_trend([1, 2, 3, 10, 10, 7], 5, 5))
+
+    def test_below_trend(self):
+        # [20, 20, 10, 10, 7]: mean 13.4, close 7 is below
+        self.assertFalse(above_trend([20, 20, 20, 10, 10, 7], 5, 5))
+
+    def test_exactly_at_trend_is_not_above(self):
+        # [4, 4, 10, 10, 7]: mean 35 / 5 = 7, close 7 is not above
+        self.assertFalse(above_trend([4, 4, 10, 10, 7], 4, 5))
+
+    def test_just_below_trend_average(self):
+        # [4, 3.9, 10, 10, 7]: mean 6.98, close 7 is above
+        self.assertTrue(above_trend([4, 3.9, 10, 10, 7], 4, 5))
+
+    def test_not_enough_candles_is_not_above(self):
+        self.assertFalse(above_trend([10, 10, 7], 2, 5))
+
+    def test_dip_in_uptrend_is_bought(self):
+        candles = make_candles([(1, 1), (2, 2), (3, 3), (10, 10), (10, 10), (10, 7), (8, 8)])
+        _, open_trade = find_trades(candles, 3, -1, trend_window=5)
+        self.assertEqual(open_trade["entry_time"], "h6")
+        self.assertEqual(open_trade["entry_price"], 8)
+
+    def test_dip_in_downtrend_is_skipped(self):
+        candles = make_candles([(20, 20), (20, 20), (20, 20), (10, 10), (10, 10), (10, 7), (8, 8)])
+        trades, open_trade = find_trades(candles, 3, -1, trend_window=5)
+        self.assertEqual(trades, [])
+        self.assertIsNone(open_trade)
+
+    def test_same_downtrend_is_bought_with_filter_off(self):
+        # without the filter, the crash itself is a signal: i3 [20, 20, 10]
+        # has z = -1.414 -> buy at i4 open 10, and it's still holding
+        candles = make_candles([(20, 20), (20, 20), (20, 20), (10, 10), (10, 10), (10, 7), (8, 8)])
+        _, open_trade = find_trades(candles, 3, -1)
+        self.assertEqual(open_trade["entry_time"], "h4")
+        self.assertEqual(open_trade["entry_price"], 10)
+
+    def test_not_enough_candles_for_trend_means_no_buy(self):
+        # BASIC buys at h3 without the filter (see TestFindTrades)
+        trades, open_trade = find_trades(make_candles(BASIC), 3, -1, trend_window=5)
+        self.assertEqual(trades, [])
+        self.assertIsNone(open_trade)
+
+    def test_filter_does_not_force_an_exit(self):
+        # buy at 8 (h6). i6 close 5: z of [10, 7, 5] is negative, and 5 is
+        # below the trend [3, 10, 10, 7, 5] mean 7 -- still holds.
+        # i7 close 9: [7, 5, 9] mean 7, z > 0 -> sell at i8 open 9.5
+        candles = make_candles([(1, 1), (2, 2), (3, 3), (10, 10), (10, 10), (10, 7),
+                                (8, 5), (5, 9), (9.5, 9.5)])
+        trades, _ = find_trades(candles, 3, -1, trend_window=5)
+        self.assertEqual(trades, [{
+            "entry_time": "h6", "entry_price": 8,
+            "exit_time": "h8", "exit_price": 9.5,
+            "reason": "signal", "hours": 2,
+        }])
+
+
 class TestProfit(unittest.TestCase):
     def test_no_fees(self):
         # $100 at 8 = 12.5 coins; at 11 = $137.50
@@ -258,29 +326,87 @@ class TestFiles(unittest.TestCase):
                 rows = list(csv.DictReader(f))
         self.assertEqual(rows[0]["profit"], "-0.7586")
 
-    def test_main_runs_and_saves_trades(self):
-        # 25 flat-ish candles so the default window of 20 fills,
-        # then a dip and a recovery
-        pairs = [(10, 10 + (i % 2) * 0.1) for i in range(25)]
-        pairs += [(10, 8), (8, 8.5), (8.5, 10.5), (10.5, 10.5), (10.5, 10.5)]
+    def test_trades_name(self):
+        self.assertEqual(trades_name("candles_coinbase_btc_usd_1h.csv", "kraken taker"),
+                         "trades_coinbase_btc_usd_1h_kraken_taker.csv")
+
+    def test_trades_name_three_word_fee(self):
+        self.assertEqual(trades_name("candles_coinbase_crv_usd_1h.csv", "coinbase adv2 maker"),
+                         "trades_coinbase_crv_usd_1h_coinbase_adv2_maker.csv")
+
+    def test_trades_name_drops_folder(self):
+        self.assertEqual(trades_name(os.path.join("data", "candles_kraken_crv_usd_1h.csv"),
+                                     "kraken maker"),
+                         "trades_kraken_crv_usd_1h_kraken_maker.csv")
+
+    def test_trades_name_without_candles_prefix(self):
+        self.assertEqual(trades_name("mydata.csv", "kraken taker"),
+                         "trades_mydata_kraken_taker.csv")
+
+
+class TestMain(unittest.TestCase):
+    # 25 flat-ish candles so the window of 20 fills, then a dip and recovery:
+    #   i25 close 8 -> z far below -2 -> buy at i26 open 8
+    #   i26 close 8.5 -> still below average, hold
+    #   i27 close 10.5 -> above average -> sell at i28 open 10.5
+    PAIRS = [(10, 10 + (i % 2) * 0.1) for i in range(25)]
+    PAIRS += [(10, 8), (8, 8.5), (8.5, 10.5), (10.5, 10.5), (10.5, 10.5)]
+
+    def run_main(self, trend_window):
         with tempfile.TemporaryDirectory() as folder:
             old = os.getcwd()
             os.chdir(folder)
             try:
-                with open("c.csv", "w", newline="") as f:
+                with open("candles_test_1h.csv", "w", newline="") as f:
                     f.write("timestamp,date,open,high,low,close,volume\n")
-                    for h, (o, c) in enumerate(pairs):
+                    for h, (o, c) in enumerate(self.PAIRS):
                         f.write(f"{h * H},h{h},{o},{o},{c},{c},1\n")
                 out = io.StringIO()
-                with contextlib.redirect_stdout(out):
-                    main(["c.csv"])
-                with open("backtest_trades.csv", newline="") as f:
-                    rows = list(csv.DictReader(f))
+                with mock.patch.object(backtest, "TREND_WINDOW", trend_window), \
+                     contextlib.redirect_stdout(out):
+                    main(["candles_test_1h.csv"])
+                files = {}
+                for name in os.listdir("."):
+                    if name.startswith("trades_"):
+                        with open(name, newline="") as f:
+                            files[name] = list(csv.DictReader(f))
             finally:
                 os.chdir(old)
-        self.assertEqual(len(rows), 1)
-        self.assertEqual(rows[0]["entry_time"], "h26")
-        self.assertIn("Saved 1 trades", out.getvalue())
+        return out.getvalue(), files
+
+    def test_saves_one_file_per_fee_level(self):
+        _, files = self.run_main(None)
+        expected = {f"trades_test_1h_{name.replace(' ', '_')}.csv" for name in FEES}
+        self.assertEqual(set(files), expected)
+        self.assertEqual(len(files), 6)
+
+    def test_same_trade_in_every_file(self):
+        _, files = self.run_main(None)
+        for rows in files.values():
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["entry_time"], "h26")
+            self.assertEqual(rows[0]["exit_time"], "h28")
+
+    def test_each_file_uses_its_own_fees(self):
+        _, files = self.run_main(None)
+        # kraken taker: 99.62 / 8 = 12.4525 coins; * 10.5 = 130.75125;
+        #   * 0.9962 = 130.254395 -> profit 30.2544
+        self.assertEqual(files["trades_test_1h_kraken_taker.csv"][0]["profit"], "30.2544")
+        # kraken maker: 99.78 / 8 = 12.4725 coins; * 10.5 = 130.96125;
+        #   * 0.9978 = 130.673135 -> profit 30.6731
+        self.assertEqual(files["trades_test_1h_kraken_maker.csv"][0]["profit"], "30.6731")
+
+    def test_trend_filter_blocks_the_dip_and_shows_comparison(self):
+        # only 30 candles: a 200-candle trend is never known, so no buys
+        out, files = self.run_main(200)
+        self.assertEqual(files["trades_test_1h_kraken_taker.csv"], [])
+        self.assertIn("WITHOUT the trend filter", out)
+        self.assertIn("trend filter 200 candles", out)
+
+    def test_no_comparison_when_filter_is_off(self):
+        out, _ = self.run_main(None)
+        self.assertNotIn("WITHOUT the trend filter", out)
+        self.assertIn("trend filter off", out)
 
 
 if __name__ == "__main__":

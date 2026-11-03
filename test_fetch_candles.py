@@ -1,8 +1,12 @@
+import contextlib
 import csv
+import io
 import os
 import tempfile
 import unittest
+from unittest import mock
 
+import fetch_candles
 from fetch_candles import (
     csv_name,
     date_to_ms,
@@ -206,6 +210,48 @@ class TestCsv(unittest.TestCase):
 
     def test_csv_name(self):
         self.assertEqual(csv_name("coinbase", "CRV/USD", "1h"), "candles_coinbase_crv_usd_1h.csv")
+
+
+class TestMain(unittest.TestCase):
+    """main() with the exchange and fetch_all faked, so no network is used."""
+
+    def run_main(self, args):
+        calls = []
+
+        def fake_fetch_all(exchange, symbol, timeframe, since_ms, now_ms):
+            calls.append((exchange, symbol, timeframe, since_ms))
+            return [candle(since_ms), candle(since_ms + H)]
+
+        fake_ccxt = mock.Mock()
+        fake_ccxt.coinbase.return_value = "coinbase exchange"
+        fake_ccxt.kraken.return_value = "kraken exchange"
+        with tempfile.TemporaryDirectory() as folder:
+            old = os.getcwd()
+            os.chdir(folder)
+            try:
+                with mock.patch.object(fetch_candles, "ccxt", fake_ccxt), \
+                     mock.patch.object(fetch_candles, "fetch_all", fake_fetch_all), \
+                     contextlib.redirect_stdout(io.StringIO()):
+                    fetch_candles.main(args)
+                files = sorted(os.listdir("."))
+            finally:
+                os.chdir(old)
+        return calls, files
+
+    def test_defaults(self):
+        calls, files = self.run_main([])
+        self.assertEqual(calls, [("coinbase exchange", "CRV/USD", "1h", date_to_ms("2023-10-01"))])
+        self.assertEqual(files, ["candles_coinbase_crv_usd_1h.csv"])
+
+    def test_start_date_and_exchange(self):
+        calls, files = self.run_main(["2026-09-29", "kraken"])
+        self.assertEqual(calls, [("kraken exchange", "CRV/USD", "1h", date_to_ms("2026-09-29"))])
+        self.assertEqual(files, ["candles_kraken_crv_usd_1h.csv"])
+
+    def test_symbol(self):
+        calls, files = self.run_main(["2023-10-01", "coinbase", "BTC/USD"])
+        self.assertEqual(calls[0][1], "BTC/USD")
+        self.assertEqual(files, ["candles_coinbase_btc_usd_1h.csv"])
 
 
 if __name__ == "__main__":

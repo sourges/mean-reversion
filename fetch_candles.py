@@ -4,6 +4,7 @@ Usage (from the mean-reversion folder, venv active):
     python fetch_candles.py                         uses the settings below
     python fetch_candles.py 2023-10-01              start from that date
     python fetch_candles.py 2023-10-01 kraken       another exchange
+    python fetch_candles.py 2023-10-01 coinbase BTC/USD   another coin
 
 The CSV has one row per candle:
     timestamp, date, open, high, low, close, volume
@@ -113,17 +114,18 @@ def csv_name(exchange_id, symbol, timeframe):
 def main(args):
     start_date = args[0] if len(args) > 0 else START_DATE
     exchange_id = args[1] if len(args) > 1 else EXCHANGE
+    symbol = args[2] if len(args) > 2 else SYMBOL
 
     exchange = getattr(ccxt, exchange_id)()  # public data, no API keys needed
     now_ms = int(time.time() * 1000)
-    print(f"Fetching {SYMBOL} {TIMEFRAME} from {exchange_id}, starting {start_date}")
+    print(f"Fetching {symbol} {TIMEFRAME} from {exchange_id}, starting {start_date}")
 
-    candles = fetch_all(exchange, SYMBOL, TIMEFRAME, date_to_ms(start_date), now_ms)
+    candles = fetch_all(exchange, symbol, TIMEFRAME, date_to_ms(start_date), now_ms)
     if not candles:
         print("No candles came back. Check the symbol, exchange and date.")
         return
 
-    path = csv_name(exchange_id, SYMBOL, TIMEFRAME)
+    path = csv_name(exchange_id, symbol, TIMEFRAME)
     write_csv(candles, path)
     print(f"Saved {len(candles)} candles to {path}")
     print(f"  first: {ms_to_date(candles[0][0])}   last: {ms_to_date(candles[-1][0])}")
