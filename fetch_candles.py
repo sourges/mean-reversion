@@ -8,6 +8,12 @@ Usage (from the mean-reversion folder, venv active):
     python fetch_candles.py 2021-10-01 coinbase CRV/USD 2023-10-01
                                        stop at an end date (not included);
                                        the dates go in the file name
+    python fetch_candles.py 2021-10-01 coinbase BTC/USD now 1d
+                                       another candle size ("now" = no end date)
+
+If the exchange doesn't offer a candle size (Coinbase has no 4h), it
+downloads 1h candles and combines them: every 4 hours starting at
+00:00 UTC become one 4h candle.
 
 The CSV has one row per candle:
     timestamp, date, open, high, low, close, volume
@@ -99,6 +105,41 @@ def fetch_all(exchange, symbol, timeframe, since_ms, now_ms, limit=BATCH_LIMIT):
     return drop_unfinished(candles, tf_ms, now_ms)
 
 
+def combine_candles(candles, tf_ms):
+    """Merge smaller candles into bigger ones, e.g. 1h into 4h.
+
+    Each candle goes in the block that starts at a multiple of tf_ms
+    (for 4h: 00:00, 04:00, 08:00 ... UTC). For each block:
+    open = first open, high = highest high, low = lowest low,
+    close = last close, volume = total. A block with missing hours
+    (an exchange outage) is still made from the hours that exist.
+    Candles must be sorted oldest first.
+    """
+    combined = []
+    for ts, o, h, l, c, v in candles:
+        start = ts // tf_ms * tf_ms
+        if combined and combined[-1][0] == start:
+            block = combined[-1]
+            block[2] = max(block[2], h)
+            block[3] = min(block[3], l)
+            block[4] = c
+            block[5] += v
+        else:
+            combined.append([start, o, h, l, c, v])
+    return combined
+
+
+def fetch_timeframe(exchange, symbol, timeframe, since_ms, end_ms):
+    """fetch_all, but builds the candle size from 1h if the exchange lacks it."""
+    if timeframe in exchange.timeframes:
+        return fetch_all(exchange, symbol, timeframe, since_ms, end_ms)
+    print(f"  {timeframe} not offered here: fetching 1h and combining")
+    hourly = fetch_all(exchange, symbol, "1h", since_ms, end_ms)
+    tf_ms = exchange.parse_timeframe(timeframe) * 1000
+    # the newest block may still be forming even if its hours are done
+    return drop_unfinished(combine_candles(hourly, tf_ms), tf_ms, end_ms)
+
+
 def write_csv(candles, path):
     """Save candles to a CSV with a header row."""
     with open(path, "w", newline="") as f:
@@ -125,21 +166,22 @@ def main(args):
     start_date = args[0] if len(args) > 0 else START_DATE
     exchange_id = args[1] if len(args) > 1 else EXCHANGE
     symbol = args[2] if len(args) > 2 else SYMBOL
-    end_date = args[3] if len(args) > 3 else None
+    end_date = args[3] if len(args) > 3 and args[3] != "now" else None
+    timeframe = args[4] if len(args) > 4 else TIMEFRAME
 
     exchange = getattr(ccxt, exchange_id)()  # public data, no API keys needed
     now_ms = int(time.time() * 1000)
     # stop at the end date (candles that open before it), but never past now
     end_ms = now_ms if end_date is None else min(date_to_ms(end_date), now_ms)
     until = "today" if end_date is None else end_date
-    print(f"Fetching {symbol} {TIMEFRAME} from {exchange_id}, {start_date} to {until}")
+    print(f"Fetching {symbol} {timeframe} from {exchange_id}, {start_date} to {until}")
 
-    candles = fetch_all(exchange, symbol, TIMEFRAME, date_to_ms(start_date), end_ms)
+    candles = fetch_timeframe(exchange, symbol, timeframe, date_to_ms(start_date), end_ms)
     if not candles:
         print("No candles came back. Check the symbol, exchange and date.")
         return
 
-    path = csv_name(exchange_id, symbol, TIMEFRAME, start_date, end_date)
+    path = csv_name(exchange_id, symbol, timeframe, start_date, end_date)
     write_csv(candles, path)
     print(f"Saved {len(candles)} candles to {path}")
     print(f"  first: {ms_to_date(candles[0][0])}   last: {ms_to_date(candles[-1][0])}")

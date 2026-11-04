@@ -8,10 +8,12 @@ from unittest import mock
 
 import fetch_candles
 from fetch_candles import (
+    combine_candles,
     csv_name,
     date_to_ms,
     drop_unfinished,
     fetch_all,
+    fetch_timeframe,
     merge_candles,
     ms_to_date,
     next_since,
@@ -220,13 +222,87 @@ class TestCsv(unittest.TestCase):
                          "candles_coinbase_crv_usd_1h_2021-10-01_to_2023-10-01.csv")
 
 
+def hourly(h, o, hi, lo, c, v):
+    return [h * H, o, hi, lo, c, v]
+
+
+class TestCombine(unittest.TestCase):
+    FOUR = 4 * H
+
+    def test_two_blocks(self):
+        candles = [
+            hourly(0, 1.0, 1.5, 0.9, 1.2, 10), hourly(1, 1.2, 1.8, 1.1, 1.7, 20),
+            hourly(2, 1.7, 1.9, 1.0, 1.1, 30), hourly(3, 1.1, 1.3, 0.8, 1.25, 40),
+            hourly(4, 1.25, 1.4, 1.2, 1.3, 5), hourly(5, 1.3, 2.0, 1.3, 1.9, 5),
+            hourly(6, 1.9, 1.95, 1.6, 1.6, 5), hourly(7, 1.6, 1.7, 1.5, 1.55, 5),
+        ]
+        self.assertEqual(combine_candles(candles, self.FOUR), [
+            # open of hour 0, top high 1.9, bottom low 0.8, close of hour 3, 10+20+30+40
+            [0, 1.0, 1.9, 0.8, 1.25, 100],
+            [4 * H, 1.25, 2.0, 1.2, 1.55, 20],
+        ])
+
+    def test_missing_hour_inside_a_block(self):
+        # hour 2 missing: the block is made from hours 0, 1, 3
+        candles = [hourly(0, 1, 2, 1, 1.5, 1), hourly(1, 1.5, 3, 1.4, 2, 1),
+                   hourly(3, 2, 2.5, 0.5, 1, 1)]
+        self.assertEqual(combine_candles(candles, self.FOUR), [[0, 1, 3, 0.5, 1, 3]])
+
+    def test_start_not_on_a_block_edge(self):
+        # hours 2, 3 belong to the 00:00 block; 4, 5 to the 04:00 block
+        candles = [hourly(h, h, h, h, h, 1) for h in (2, 3, 4, 5)]
+        self.assertEqual(combine_candles(candles, self.FOUR),
+                         [[0, 2, 3, 2, 3, 2], [4 * H, 4, 5, 4, 5, 2]])
+
+    def test_empty(self):
+        self.assertEqual(combine_candles([], self.FOUR), [])
+
+    def test_does_not_change_the_input(self):
+        candles = [hourly(0, 1, 2, 1, 1.5, 1), hourly(1, 1.5, 3, 1.4, 2, 1)]
+        combine_candles(candles, self.FOUR)
+        self.assertEqual(candles[0], [0, 1, 2, 1, 1.5, 1])
+
+
+class FakeWithTimeframes(FakeCoinbase):
+    """Coinbase-like windows, with a list of offered candle sizes."""
+
+    def __init__(self, candles, offered):
+        super().__init__(candles)
+        self.timeframes = {tf: tf for tf in offered}
+        self.asked = []
+
+    def parse_timeframe(self, timeframe):
+        return {"1h": 3600, "4h": 14400, "1d": 86400}[timeframe]
+
+    def fetch_ohlcv(self, symbol, timeframe, since, limit):
+        self.asked.append(timeframe)
+        return super().fetch_ohlcv(symbol, timeframe, since, limit)
+
+
+class TestFetchTimeframe(unittest.TestCase):
+    def test_builds_4h_from_1h_when_not_offered(self):
+        # hours 0..9, now is 10:00: blocks 00:00 (0-3), 04:00 (4-7), 08:00 (8-9)
+        # the 08:00 block isn't done until 12:00, so it's dropped
+        hours = [[h * H, 1, h + 1, 0.5, h, 1] for h in range(10)]
+        ex = FakeWithTimeframes(hours, ["1h", "1d"])
+        result = fetch_timeframe(ex, "CRV/USD", "4h", 0, 10 * H)
+        self.assertEqual(result, [[0, 1, 4, 0.5, 3, 4], [4 * H, 1, 8, 0.5, 7, 4]])
+        self.assertEqual(set(ex.asked), {"1h"})
+
+    def test_asks_directly_when_offered(self):
+        ex = FakeWithTimeframes([candle(0)], ["1h", "4h"])
+        with contextlib.redirect_stdout(io.StringIO()):
+            fetch_timeframe(ex, "CRV/USD", "4h", 0, 300 * 4 * H)
+        self.assertEqual(set(ex.asked), {"4h"})
+
+
 class TestMain(unittest.TestCase):
     """main() with the exchange and fetch_all faked, so no network is used."""
 
     def run_main(self, args):
         calls = []
 
-        def fake_fetch_all(exchange, symbol, timeframe, since_ms, now_ms):
+        def fake_fetch_timeframe(exchange, symbol, timeframe, since_ms, now_ms):
             calls.append((exchange, symbol, timeframe, since_ms))
             self.end_ms = now_ms
             return [candle(since_ms), candle(since_ms + H)]
@@ -239,7 +315,7 @@ class TestMain(unittest.TestCase):
             os.chdir(folder)
             try:
                 with mock.patch.object(fetch_candles, "ccxt", fake_ccxt), \
-                     mock.patch.object(fetch_candles, "fetch_all", fake_fetch_all), \
+                     mock.patch.object(fetch_candles, "fetch_timeframe", fake_fetch_timeframe), \
                      contextlib.redirect_stdout(io.StringIO()):
                     fetch_candles.main(args)
                 files = sorted(os.listdir("."))
@@ -267,6 +343,18 @@ class TestMain(unittest.TestCase):
         self.assertEqual(calls[0][3], date_to_ms("2021-10-01"))
         self.assertEqual(self.end_ms, date_to_ms("2023-10-01"))
         self.assertEqual(files, ["candles_coinbase_crv_usd_1h_2021-10-01_to_2023-10-01.csv"])
+
+    def test_now_means_no_end_date_and_timeframe_arg(self):
+        with mock.patch.object(fetch_candles.time, "time", return_value=1_800_000_000):
+            calls, files = self.run_main(["2021-10-01", "coinbase", "BTC/USD", "now", "1d"])
+        self.assertEqual(calls[0][1:3], ("BTC/USD", "1d"))
+        self.assertEqual(self.end_ms, 1_800_000_000_000)
+        self.assertEqual(files, ["candles_coinbase_btc_usd_1d.csv"])
+
+    def test_timeframe_with_end_date(self):
+        calls, files = self.run_main(["2021-10-01", "coinbase", "CRV/USD", "2023-10-01", "4h"])
+        self.assertEqual(calls[0][2], "4h")
+        self.assertEqual(files, ["candles_coinbase_crv_usd_4h_2021-10-01_to_2023-10-01.csv"])
 
     def test_no_end_date_fetches_to_now(self):
         with mock.patch.object(fetch_candles.time, "time", return_value=1_800_000_000):
