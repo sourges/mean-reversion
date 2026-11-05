@@ -143,6 +143,23 @@ class TestFindRuleTrades(unittest.TestCase):
         self.assertEqual([(t["entry_price"], t["exit_price"], t["exit_time"]) for t in trades],
                          [(12.5, 9.5, "h5")])
 
+    def test_one_candle_late(self):
+        # same signals as DONCHIAN, each filled 2 candles later:
+        #   buy signal at i3 -> fill at i5 open 14
+        #   i5 close 12 < lowest of [13, 14] -> sell, fill at i7 open 11
+        candles = make_candles(self.DONCHIAN + [(11, 11)])
+        buy, sell = make_rule({"kind": "donchian", "entry": 3, "exit": 2})
+        trades, open_trade = find_rule_trades(candles, buy, sell, delay=2)
+        self.assertEqual([(t["entry_time"], t["entry_price"], t["exit_time"], t["exit_price"])
+                          for t in trades], [("h5", 14, "h7", 11)])
+        self.assertIsNone(open_trade)
+
+    def test_late_signal_near_the_end_cannot_fill(self):
+        # DONCHIAN's buy signal at i3 needs i5 to fill; with only i0..i4 it can't
+        candles = make_candles(self.DONCHIAN[:5])
+        buy, sell = make_rule({"kind": "donchian", "entry": 3, "exit": 2})
+        self.assertEqual(find_rule_trades(candles, buy, sell, delay=2), ([], None))
+
     def test_still_holding_at_the_end(self):
         # same entry, then i5 close 15: lowest of [13, 14] is 13 -> hold
         candles = make_candles(self.DONCHIAN[:5] + [(14, 15)])

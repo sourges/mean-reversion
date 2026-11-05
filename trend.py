@@ -75,8 +75,11 @@ def make_rule(rule):
     raise ValueError(f"unknown rule kind: {rule['kind']}")
 
 
-def find_rule_trades(candles, should_buy, should_sell):
+def find_rule_trades(candles, should_buy, should_sell, delay=1):
     """Same walk as backtest.find_trades, with any buy/sell rule.
+
+    delay = how many candles after the signal the order fills: 1 = the
+    next open (normal), 2 = one candle late (a missed candle live).
 
     Returns (trades, open_trade). A position still held at the end isn't
     a trade yet; it's returned separately.
@@ -84,8 +87,8 @@ def find_rule_trades(candles, should_buy, should_sell):
     closes = [c["close"] for c in candles]
     trades = []
     position = None
-    for i in range(len(candles) - 1):
-        fill = candles[i + 1]
+    for i in range(len(candles) - delay):
+        fill = candles[i + delay]
         if position is None:
             if should_buy(closes, i):
                 position = {"entry_ts": fill["timestamp"], "entry_time": fill["date"],
